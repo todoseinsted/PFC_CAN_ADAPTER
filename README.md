@@ -37,6 +37,12 @@ El programa `Control-PFC-SPI.py`:
 5. Utiliza el identificador CAN extendido `0x080601A0`.
 6. Arranca siempre en estado seguro, enviando `STOP`.
 7. Al salir normalmente, envía tres tramas adicionales de `STOP`.
+8. Comprueba después de cada envío los indicadores de error del MCP2515.
+9. Si detecta dos errores consecutivos, reinicia automáticamente el CAN y
+   vuelve a aplicar la consigna vigente.
+10. Mientras `START` está activo, realiza un reinicio preventivo cada 5
+    segundos para recuperar también los bloqueos que no puedan diagnosticarse
+    de forma fiable a través del conversor de nivel. En `STOP` queda en espera.
 
 La transmisión *one-shot* evita que el MCP2515 retransmita indefinidamente si
 el PFC está desconectado o no responde. El siguiente ciclo de 500 ms realiza un
@@ -89,8 +95,8 @@ El resultado esperado contiene mensajes como:
 
 ```text
 MCP2515: modo TX directo, sin depender de MISO ni de INT
-STOP 1/4 transmitido (TX directo)
-STOP 2/4 transmitido (TX directo)
+STOP 1/4 transmitido: TEC=0, REC=0, EFLG=0x00
+STOP 2/4 transmitido: TEC=0, REC=0, EFLG=0x00
 ```
 
 Esta prueba no habilita la salida del PFC.
@@ -107,7 +113,7 @@ Al comenzar se muestra:
 
 ```text
 --- Control PFC TonHe por SPI/MCP2515 ---
-Comandos: START,<tension>,<corriente> | STOP | STATUS | QUIT
+Comandos: START,<tension>,<corriente> | STOP | STATUS | RECOVER | QUIT
 Estado inicial seguro: STOP
 ```
 
@@ -128,11 +134,13 @@ START,311,10
 Si los valores son válidos, se muestra:
 
 ```text
-START preparado: 311.0 V, 10.00 A
+START activo: 311.0 V, 10.00 A
 ```
 
-Desde ese momento, la trama `START` se transmite cada 500 ms hasta recibir un
-comando `STOP`, finalizar el programa o producirse un error.
+Antes de aplicar cada nuevo `START`, el programa reinicia el MCP2515. Esto
+permite volver a enviar `START` para recuperarse de un bloqueo sin cerrar y
+volver a ejecutar la aplicación. Desde ese momento, la trama se transmite cada
+500 ms hasta recibir un comando `STOP` o finalizar el programa.
 
 ### Apagar el PFC
 
@@ -142,8 +150,8 @@ Escribir:
 STOP
 ```
 
-El programa cambia inmediatamente la consigna a cero y continúa enviando la
-trama de parada cada 500 ms.
+El programa cambia inmediatamente la consigna a cero, reinicia el CAN y
+continúa enviando la trama de parada cada 500 ms.
 
 ### Consultar la consigna local
 
@@ -153,9 +161,51 @@ Escribir:
 STATUS
 ```
 
-`STATUS` muestra la orden que el PLC está intentando transmitir. No confirma la
-tensión real ni las alarmas internas del PFC, porque esta instalación funciona
-en modo de transmisión directa y no depende del retorno MISO ni de `INT`.
+`STATUS` muestra la orden que el PLC está intentando transmitir, la cantidad
+de tramas enviadas, recuperaciones realizadas, errores consecutivos, los
+indicadores CAN más recientes y el tiempo hasta el próximo refresco.
+
+Estos datos permiten advertir fallos de transmisión o un MCP2515 bloqueado,
+pero no confirman por sí solos la tensión real ni todas las alarmas internas
+del PFC. La línea `INT` no está conectada y la lectura MISO atraviesa el
+conversor de nivel instalado.
+
+### Forzar una recuperación
+
+Si se sospecha que el CAN está bloqueado, escribir:
+
+```text
+RECOVER
+```
+
+El programa reinicia el MCP2515 y reaplica de inmediato la consigna vigente.
+Normalmente no hace falta utilizarlo porque la misma recuperación se ejecuta
+automáticamente.
+
+### Registro de comunicación
+
+Los arranques, paradas, errores y recuperaciones se guardan en:
+
+```text
+/home/nferraro/Documents/control-pfc.log
+```
+
+Para observar el registro desde otra terminal:
+
+```bash
+tail -f /home/nferraro/Documents/control-pfc.log
+```
+
+El intervalo preventivo puede modificarse al iniciar el controlador. Por
+ejemplo, para usar 10 segundos:
+
+```bash
+python3 /home/nferraro/Documents/Control-PFC-SPI.py --recovery-interval 10
+```
+
+El valor `0` desactiva únicamente el refresco preventivo; la detección de
+errores y las recuperaciones al recibir `START`, `STOP` o `RECOVER` continúan
+activas.
 
 ### Finalizar el programa
 
@@ -218,6 +268,16 @@ Comprobar, con el equipo en condición segura:
 - Cristal del HW-184 marcado `8.000`.
 - Conversión de nivel en `SCK`, `SI/MOSI`, `SO/MISO` y `CS`.
 - Que no haya otra aplicación utilizando `/dev/spidev0.1`.
+
+### La comunicación se pierde con ruido eléctrico
+
+El programa informa el error y recupera automáticamente el MCP2515. Si el
+problema se repite, revisar también la instalación física: par trenzado para
+CAN-H/CAN-L, blindaje correctamente terminado, resistencias de 120 ohmios sólo
+en los dos extremos, separación respecto de cables de potencia, puesta a
+tierra, alimentación limpia para el HW-184 y, si corresponde, un transceptor
+CAN aislado. La recuperación por software mejora la continuidad pero no
+reemplaza estas medidas contra interferencias.
 
 ### Hay dudas sobre el estado de salida
 

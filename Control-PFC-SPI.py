@@ -13,6 +13,7 @@ El programa original Control-PFC.py (SocketCAN) no es modificado.
 from __future__ import annotations
 
 import argparse
+import os
 import select
 import signal
 import struct
@@ -28,6 +29,8 @@ import spidev
 CONTROL_CAN_ID = 0x080601A0
 STATUS_CAN_ID = 0x1801A001
 SEND_PERIOD_SECONDS = 0.5
+DEFAULT_RECOVERY_INTERVAL_SECONDS = 5.0
+MAX_CONSECUTIVE_TX_ERRORS = 2
 
 # Límites publicados para el TH30F10025C7-WT. Además se limita la potencia
 # solicitada a la potencia nominal del módulo.
@@ -251,7 +254,11 @@ class MCP2515:
                 self._transfer([self.INSTRUCTION_RTS_TX0])
             # A 125 kbit/s una trama clásica termina holgadamente antes de 20 ms.
             time.sleep(0.020)
-            return {}
+            # Los registros de error valen cero durante una transmisión normal.
+            # Aunque el conversor instalado no permite confiar en lecturas
+            # complejas, cualquier valor persistente aquí permite detectar
+            # ausencia de ACK, error pasivo o bus-off.
+            return self.transmission_health()
 
         deadline = time.monotonic() + timeout
         while self.read_register(self.TXB0CTRL) & self.TXREQ:
@@ -283,6 +290,32 @@ class MCP2515:
                 f"TEC={tec}, REC={rec}"
             )
         return {"tx_ctrl": tx_ctrl, "eflg": eflg, "tec": tec, "rec": rec}
+
+    def transmission_health(self) -> dict[str, int]:
+        samples = []
+        for _ in range(3):
+            samples.append(
+                {
+                    "tx_ctrl": self.read_register(self.TXB0CTRL),
+                    "eflg": self.read_register(self.EFLG),
+                    "tec": self.read_register(self.TEC),
+                    "rec": self.read_register(self.REC),
+                }
+            )
+            time.sleep(0.001)
+        # Para los bits sólo se conservan los que aparecen en las tres lecturas;
+        # para los contadores se usa la mediana. Así una muestra aislada deformada
+        # por el conversor de nivel no provoca una recuperación falsa.
+        return {
+            "tx_ctrl": samples[0]["tx_ctrl"]
+            & samples[1]["tx_ctrl"]
+            & samples[2]["tx_ctrl"],
+            "eflg": samples[0]["eflg"]
+            & samples[1]["eflg"]
+            & samples[2]["eflg"],
+            "tec": sorted(sample["tec"] for sample in samples)[1],
+            "rec": sorted(sample["rec"] for sample in samples)[1],
+        }
 
     def poll_receive(self) -> list[CANFrame]:
         if not self._readback:
@@ -378,6 +411,38 @@ def print_diagnostics(mcp: MCP2515) -> None:
     )
 
 
+class EventLog:
+    def __init__(self, path: str) -> None:
+        self.path = os.path.expanduser(path)
+
+    def write(self, message: str, level: str = "INFO") -> None:
+        line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{level}] {message}"
+        print(line, flush=True)
+        try:
+            with open(self.path, "a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+        except OSError as exc:
+            print(f"ADVERTENCIA: no se pudo escribir {self.path}: {exc}", file=sys.stderr)
+
+
+def health_has_tx_error(health: dict[str, int]) -> bool:
+    # Se ignoran RX0OVR/RX1OVR porque no impiden transmitir. El resto de EFLG,
+    # TXERR/ABTF/MLOA o un contador TEC distinto de cero indican degradación.
+    return bool(
+        health.get("tx_ctrl", 0) & 0x70
+        or health.get("eflg", 0) & 0x3F
+        or health.get("tec", 0) > 0
+    )
+
+
+def format_health(health: dict[str, int]) -> str:
+    return (
+        f"TXB0CTRL=0x{health.get('tx_ctrl', 0):02X}, "
+        f"EFLG=0x{health.get('eflg', 0):02X}, "
+        f"TEC={health.get('tec', 0)}, REC={health.get('rec', 0)}"
+    )
+
+
 def send_stop_safely(mcp: MCP2515, count: int = 3) -> None:
     payload = build_control_payload(0.0, 0.0, False)
     for attempt in range(1, count + 1):
@@ -400,11 +465,20 @@ def send_stop_safely(mcp: MCP2515, count: int = 3) -> None:
                 time.sleep(0.02)
 
 
-def run_interactive(mcp: MCP2515) -> None:
+def run_interactive(
+    mcp: MCP2515,
+    event_log: EventLog,
+    recovery_interval: float,
+) -> None:
     voltage = 0.0
     current = 0.0
     enabled = False
     stop_requested = False
+    frames_sent = 0
+    recoveries = 0
+    consecutive_tx_errors = 0
+    last_health = {"tx_ctrl": 0, "eflg": 0, "tec": 0, "rec": 0}
+    last_recovery = time.monotonic()
 
     def request_stop(_signum: int, _frame: object) -> None:
         nonlocal stop_requested
@@ -413,22 +487,75 @@ def run_interactive(mcp: MCP2515) -> None:
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
 
+    def recover(reason: str) -> None:
+        nonlocal recoveries, consecutive_tx_errors, last_recovery, next_send
+        event_log.write(f"RECUPERACIÓN CAN: {reason}", "WARN")
+        mcp.initialize()
+        recoveries += 1
+        consecutive_tx_errors = 0
+        last_recovery = time.monotonic()
+        # Reaplicar inmediatamente la consigna vigente después del reset.
+        payload = build_control_payload(voltage, current, enabled)
+        mcp.send_extended(CONTROL_CAN_ID, payload)
+        next_send = time.monotonic() + SEND_PERIOD_SECONDS
+        event_log.write(
+            f"CAN reinicializado; consigna reaplicada: "
+            f"{'START' if enabled else 'STOP'}"
+        )
+
+    event_log.write("Control PFC iniciado")
     print("--- Control PFC TonHe por SPI/MCP2515 ---")
-    print("Comandos: START,<tension>,<corriente> | STOP | STATUS | QUIT")
+    print("Comandos: START,<tension>,<corriente> | STOP | STATUS | RECOVER | QUIT")
     print("Estado inicial seguro: STOP")
 
     next_send = 0.0
     while not stop_requested:
         now = time.monotonic()
+        if (
+            enabled
+            and recovery_interval > 0
+            and now - last_recovery >= recovery_interval
+        ):
+            try:
+                recover(f"refresco preventivo cada {recovery_interval:g} s")
+            except (MCP2515Error, OSError) as exc:
+                event_log.write(f"Falló el refresco preventivo: {exc}", "ERROR")
+
         if now >= next_send:
             payload = build_control_payload(voltage, current, enabled)
             try:
-                mcp.send_extended(CONTROL_CAN_ID, payload)
-            except CANTransmissionError as exc:
+                last_health = mcp.send_extended(CONTROL_CAN_ID, payload)
+                frames_sent += 1
+                if health_has_tx_error(last_health):
+                    consecutive_tx_errors += 1
+                    event_log.write(
+                        f"Error CAN {consecutive_tx_errors}/"
+                        f"{MAX_CONSECUTIVE_TX_ERRORS}: {format_health(last_health)}",
+                        "WARN",
+                    )
+                    if consecutive_tx_errors >= MAX_CONSECUTIVE_TX_ERRORS:
+                        recover("errores consecutivos de transmisión")
+                else:
+                    if consecutive_tx_errors:
+                        event_log.write("La transmisión CAN volvió a estado normal")
+                    consecutive_tx_errors = 0
+            except (CANTransmissionError, MCP2515Error, OSError) as exc:
+                event_log.write(f"Fallo SPI/CAN: {exc}", "ERROR")
+                try:
+                    recover("excepción de comunicación")
+                except (MCP2515Error, OSError) as recovery_exc:
+                    event_log.write(
+                        f"No se pudo recuperar; se fuerza consigna STOP: {recovery_exc}",
+                        "ERROR",
+                    )
+                    enabled = False
+                    voltage = 0.0
+                    current = 0.0
+            except Exception as exc:
                 enabled = False
                 voltage = 0.0
                 current = 0.0
-                print(f"ERROR: {exc}; se fuerza STOP", file=sys.stderr)
+                event_log.write(f"Error inesperado: {exc}; se fuerza STOP", "ERROR")
             next_send = now + SEND_PERIOD_SECONDS
 
         for frame in mcp.poll_receive():
@@ -457,24 +584,42 @@ def run_interactive(mcp: MCP2515) -> None:
                 voltage = requested_voltage
                 current = requested_current
                 enabled = True
-                next_send = 0.0
-                print(f"START preparado: {voltage:.1f} V, {current:.2f} A")
+                recover("nuevo comando START")
+                event_log.write(f"START activo: {voltage:.1f} V, {current:.2f} A")
             elif parts[0] == "STOP":
                 enabled = False
                 voltage = 0.0
                 current = 0.0
-                next_send = 0.0
-                print("STOP preparado")
+                recover("comando STOP")
+                event_log.write("STOP activo")
             elif parts[0] == "STATUS":
                 print(
                     f"Consigna: {'START' if enabled else 'STOP'}, "
                     f"{voltage:.1f} V, {current:.2f} A"
                 )
-                print_diagnostics(mcp)
+                print(
+                    f"Tramas: {frames_sent}, recuperaciones: {recoveries}, "
+                    f"errores consecutivos: {consecutive_tx_errors}"
+                )
+                print(f"Último estado CAN: {format_health(last_health)}")
+                if recovery_interval <= 0:
+                    print("Refresco preventivo desactivado")
+                elif not enabled:
+                    print("Refresco preventivo en espera hasta el próximo START")
+                else:
+                    print(
+                        f"Próximo refresco preventivo en "
+                        f"{max(0.0, recovery_interval - (time.monotonic() - last_recovery)):.1f} s"
+                    )
+            elif parts[0] == "RECOVER":
+                recover("solicitud manual")
             elif parts[0] in {"QUIT", "EXIT"}:
                 break
             else:
-                print("Comando inválido. Use START,311,10 | STOP | STATUS | QUIT")
+                print(
+                    "Comando inválido. Use START,311,10 | STOP | STATUS | "
+                    "RECOVER | QUIT"
+                )
         except ValueError as exc:
             print(f"Comando rechazado: {exc}")
 
@@ -486,6 +631,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--spi-bus", type=int, default=0)
     parser.add_argument("--spi-device", type=int, default=1)
     parser.add_argument("--spi-speed", type=int, default=500_000)
+    parser.add_argument(
+        "--recovery-interval",
+        type=float,
+        default=DEFAULT_RECOVERY_INTERVAL_SECONDS,
+        help="segundos entre reinicios preventivos del MCP2515; 0 los desactiva",
+    )
+    parser.add_argument(
+        "--log-file",
+        default="~/Documents/control-pfc.log",
+        help="archivo de eventos y recuperaciones",
+    )
     parser.add_argument(
         "--readback",
         action="store_true",
@@ -504,7 +660,22 @@ def main() -> int:
     args = parse_args()
     mcp: MCP2515 | None = None
     initialized = False
+    lock_file = None
     try:
+        if args.recovery_interval < 0:
+            raise ValueError("--recovery-interval no puede ser negativo")
+
+        # Impide que dos instancias manejen simultáneamente el mismo MCP2515.
+        import fcntl
+
+        lock_file = open("/tmp/control-pfc-spi.lock", "w", encoding="ascii")
+        try:
+            fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise MCP2515Error("Ya hay otra instancia controlando el PFC") from exc
+        lock_file.write(str(os.getpid()))
+        lock_file.flush()
+
         mcp = MCP2515(
             args.spi_bus,
             args.spi_device,
@@ -520,7 +691,11 @@ def main() -> int:
                 raise ValueError("--stop-test debe ser al menos 1")
             send_stop_safely(mcp, args.stop_test)
         else:
-            run_interactive(mcp)
+            run_interactive(
+                mcp,
+                EventLog(args.log_file),
+                args.recovery_interval,
+            )
         return 0
     except (MCP2515Error, OSError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -533,6 +708,8 @@ def main() -> int:
                 print(f"ADVERTENCIA: no se pudo confirmar STOP al salir: {exc}", file=sys.stderr)
         if mcp is not None:
             mcp.close()
+        if lock_file is not None:
+            lock_file.close()
 
 
 if __name__ == "__main__":
